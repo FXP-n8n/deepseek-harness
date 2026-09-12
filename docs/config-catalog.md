@@ -1535,6 +1535,13 @@ export interface StdioConfig {
   cwd: string
   /** Per-tool-call timeout in milliseconds. */
   toolCallTimeoutMs: number
+  /** Protocol eras this connection may speak; omission keeps the legacy handshake. */
+  protocolEra?: ProtocolEraConfig
+  /**
+   * Maximum multi-round-trip rounds one `tools/call` may spend fulfilling
+   * embedded requests before failing; omission uses the SDK default.
+   */
+  maxRounds?: number
   /** Fail plugin activation when the initial connection or tool synchronization fails. */
   failOnStartupError: boolean
   /** Automatic reconnect policy after a lost connection; omission uses the defaults. */
@@ -1557,10 +1564,32 @@ export interface StreamableHttpConfig {
   headers: Record<string, string>
   /** Per-tool-call timeout in milliseconds. */
   toolCallTimeoutMs: number
+  /** Protocol eras this connection may speak; omission keeps the legacy handshake. */
+  protocolEra?: ProtocolEraConfig
+  /**
+   * Maximum multi-round-trip rounds one `tools/call` may spend fulfilling
+   * embedded requests before failing; omission uses the SDK default.
+   */
+  maxRounds?: number
   /** Fail plugin activation when the initial connection or tool synchronization fails. */
   failOnStartupError: boolean
   /** Automatic reconnect policy after a lost connection; omission uses the defaults. */
   reconnect?: ReconnectConfig
+}
+
+/**
+ * Which protocol era one connection may speak.
+ *
+ * - `'legacy'` — the `initialize` handshake only, byte-identical to a 2025
+ *   client (the default).
+ * - `'auto'` — probe `server/discover`, use the modern era on definitive
+ *   modern evidence, and fall back to the handshake otherwise.
+ * - `{ pin: '<revision>' }` — require exactly that modern revision, with no
+ *   fallback.
+ */
+export type ProtocolEraConfig = 'legacy' | 'auto' | {
+  /** Modern protocol revision the connection must use, for example `2026-07-28`. */
+  pin: string
 }
 
 /** Automatic reconnect policy for one MCP server connection. */
@@ -1576,7 +1605,7 @@ export interface ReconnectConfig {
 }
 ```
 
-Source: [`packages/mcp/mcp-client/src/index.ts:98`](../packages/mcp/mcp-client/src/index.ts)
+Source: [`packages/mcp/mcp-client/src/index.ts:127`](../packages/mcp/mcp-client/src/index.ts)
 
 <a id="deepseek-aidsh-message-feedback"></a>
 

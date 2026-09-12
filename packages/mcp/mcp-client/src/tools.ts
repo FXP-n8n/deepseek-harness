@@ -14,8 +14,7 @@
 
 import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
-import type { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { ListToolsResultSchema } from '@modelcontextprotocol/sdk/types.js'
+import type { Client } from '@modelcontextprotocol/client'
 import { z } from 'zod'
 import type { Context } from '@deepseek-ai/cordis'
 import { isImageAdmissionError } from '@deepseek-ai/dsh-attachment'
@@ -25,6 +24,9 @@ import type { ToolDefinition, ToolExecution, ToolExecutionResult } from '@deepse
 import { assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { JsonSchemaNode } from '@deepseek-ai/dsh-tools'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
+import { normalizeCacheScope, normalizeCacheTtlMs, toolListCache } from './cache.ts'
+import type { CachedTool } from './cache.ts'
+import type { ElicitationBroker } from './elicitation.ts'
 
 /** Resolved options relevant to tool bridging. */
 export interface ToolBridgeOptions {
@@ -32,6 +34,10 @@ export interface ToolBridgeOptions {
   registrationFailure: 'contain' | 'throw'
   serverName: string
   toolCallTimeoutMs: number
+  /** Digest of this connection's authorization context; the cache partition key. */
+  authorization: string
+  /** In-flight execution registry for elicitation attribution, when the seam is mounted. */
+  elicitation?: ElicitationBroker
 }
 
 /** State for one sync generation: the current set of disposers keyed by public name. */
@@ -55,7 +61,12 @@ const INVALID_NAME_CHARS = /[^A-Za-z0-9_-]/g
 /** Hex chars of the SHA-256 identity hash appended on lossy normalization. */
 const HASH_LENGTH = 12
 
-/** Raw result record: the bridge owns JSON-value validation after transport. */
+/**
+ * Raw result record: the bridge, not the SDK, judges a call result. Servers in
+ * the wild return content arrays that violate the protocol schema, and
+ * `extractText` reports each unrecognized block; validating here instead would
+ * reject the whole result before the bridge can describe what it received.
+ */
 const RawCallToolResultSchema = z.record(z.string(), z.unknown())
 
 /** Raster formats supported by the durable attachment vocabulary. */
@@ -69,15 +80,25 @@ const IMAGE_MEDIA_TYPES: readonly ImageMediaType[] = [
 /** Canonical RFC 4648 base64, excluding whitespace and URL-safe aliases. */
 const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
 
-/** List without mutating the SDK's per-page output-validator cache. */
+/**
+ * List one page through the typed request path, which resolves the spec's
+ * result schema from the method name and never writes the SDK response cache.
+ */
 function listToolsUncached(client: Client, cursor?: string) {
   return client.request(
     { method: 'tools/list', ...cursor === undefined ? {} : { params: { cursor } } },
-    ListToolsResultSchema,
   )
 }
 
-/** Call without the SDK pre-validating an output schema the bridge may not support. */
+/**
+ * Call a tool through the raw request path with the bridge's own permissive
+ * result schema, so the SDK never pre-validates the result against either its
+ * protocol schema or the tool's declared output schema.
+ *
+ * `maxTotalTimeout` bounds the whole multi-round-trip flow — the embedded
+ * rounds the SDK fulfils internally count against the one configured per-call
+ * budget rather than restarting it per leg.
+ */
 function callToolUncached(
   client: Client,
   rawName: string,
@@ -91,8 +112,56 @@ function callToolUncached(
     {
       signal: exec.signal,
       timeout: opts.toolCallTimeoutMs,
+      maxTotalTimeout: opts.toolCallTimeoutMs,
     },
   )
+}
+
+/**
+ * Drain the server's `tools/list` pagination once, preserving the page-1 cache
+ * metadata that governs whether the aggregate may be served from cache.
+ *
+ * @param client - Connected client generation.
+ * @param serverName - Server namespace used in the diagnostic message.
+ * @returns Raw descriptors plus the server-declared freshness window and scope.
+ * @throws When the server repeats a continuation cursor.
+ */
+async function fetchToolDescriptors(
+  client: Client,
+  serverName: string,
+): Promise<{ tools: CachedTool[]; ttlMs: number; cacheScope: 'public' | 'private' }> {
+  const tools: CachedTool[] = []
+  const seenCursors = new Set<string>()
+  let cursor: string | undefined
+  let ttlMs = 0
+  let cacheScope: 'public' | 'private' = 'private'
+  let firstPage = true
+  while (true) {
+    const response = await listToolsUncached(client, cursor)
+    if (firstPage) {
+      ttlMs = normalizeCacheTtlMs(response.ttlMs)
+      cacheScope = normalizeCacheScope(response.cacheScope)
+      firstPage = false
+    }
+    for (const tool of response.tools) {
+      tools.push({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+        outputSchema: tool.outputSchema,
+        taskSupportRequired: tool.execution?.taskSupport === 'required',
+      })
+    }
+    cursor = response.nextCursor
+    if (cursor === undefined) break
+    if (seenCursors.has(cursor)) {
+      throw new Error(
+        `mcp-client(${serverName}): server repeated a tools/list continuation cursor — invalid tool list`,
+      )
+    }
+    seenCursors.add(cursor)
+  }
+  return { tools, ttlMs, cacheScope }
 }
 
 /**
@@ -122,10 +191,12 @@ export function publicToolName(serverName: string, rawName: string): string {
  *
  * Two phases keep the swap safe:
  *
- * 1. Fetch: drain uncached `tools/list` pagination and build the full next
- *    generation of `ToolDefinition`s under public names. Any failure here
- *    (network error, duplicate raw name, repeated continuation cursor) rejects
- *    and leaves the previous generation registered untouched.
+ * 1. Fetch: serve a fresh `tools/list` aggregate from the cache, or drain
+ *    uncached pagination once and cache the descriptors for the server's
+ *    declared `ttlMs`, then build the full next generation of
+ *    `ToolDefinition`s under public names. Any failure here (network error,
+ *    duplicate raw name, repeated continuation cursor) rejects and leaves the
+ *    previous generation registered untouched.
  * 2. Swap: dispose the previous generation, register the new one. A registry
  *    conflict here can only mean a foreign registration squats on this
  *    server's `mcp__<serverName>__` namespace — the partial generation is
@@ -135,7 +206,7 @@ export function publicToolName(serverName: string, rawName: string): string {
  *
  * @param client - Connected MCP Client instance used to list and call tools.
  * @param ctx - Cordis context providing the `tools` service for registration.
- * @param opts - Bridge options: server namespace and per-call timeout.
+ * @param opts - Bridge options: server namespace, per-call timeout, and cache partition.
  * @param previous - Disposer map from the prior sync generation; disposed
  *   during the swap phase (only after the fetch phase succeeded).
  * @returns A map of registered public tool names to their unregister
@@ -148,40 +219,45 @@ export async function syncTools(
   previous: ToolDisposers,
 ): Promise<ToolDisposers> {
   // Phase 1: fetch and build the next generation without touching the registry.
+  // A fresh cached aggregate satisfies the fetch outright; the descriptors are
+  // rebuilt into definitions so they bind to the current client generation.
+  const now = Date.now()
+  const cached = toolListCache.read(opts.serverName, opts.authorization, now)
+  let descriptors: CachedTool[]
+  if (cached === undefined) {
+    const fetched = await fetchToolDescriptors(client, opts.serverName)
+    toolListCache.write(
+      opts.serverName,
+      opts.authorization,
+      fetched.tools,
+      fetched.ttlMs,
+      fetched.cacheScope,
+      now,
+    )
+    descriptors = fetched.tools
+  } else {
+    descriptors = cached.tools
+  }
   const definitions = new Map<string, ToolDefinition>()
-  const seenCursors = new Set<string>()
-  let cursor: string | undefined
-  do {
-    const response = await listToolsUncached(client, cursor)
-    for (const tool of response.tools) {
-      const publicName = publicToolName(opts.serverName, tool.name)
-      if (definitions.has(publicName)) {
-        throw new Error(
-          `mcp-client(${opts.serverName}): server listed tool "${tool.name}" more than once — invalid tool list`,
-        )
-      }
-      definitions.set(publicName, createDefinition(
-        client,
-        ctx,
-        publicName,
-        tool.name,
-        tool.description ?? '',
-        tool.inputSchema,
-        supportedOutputSchema(tool.outputSchema),
-        tool.execution?.taskSupport === 'required',
-        opts,
-      ))
+  for (const tool of descriptors) {
+    const publicName = publicToolName(opts.serverName, tool.name)
+    if (definitions.has(publicName)) {
+      throw new Error(
+        `mcp-client(${opts.serverName}): server listed tool "${tool.name}" more than once — invalid tool list`,
+      )
     }
-    cursor = response.nextCursor
-    if (cursor) {
-      if (seenCursors.has(cursor)) {
-        throw new Error(
-          `mcp-client(${opts.serverName}): server repeated a tools/list continuation cursor — invalid tool list`,
-        )
-      }
-      seenCursors.add(cursor)
-    }
-  } while (cursor)
+    definitions.set(publicName, createDefinition(
+      client,
+      ctx,
+      publicName,
+      tool.name,
+      tool.description ?? '',
+      tool.inputSchema,
+      supportedOutputSchema(tool.outputSchema),
+      tool.taskSupportRequired,
+      opts,
+    ))
+  }
 
   // Phase 2: swap generations.
   for (const dispose of previous.values()) dispose()
@@ -319,55 +395,76 @@ function createExecutor(
   projections: WeakMap<ToolExecution, PreparedProjection>,
 ): ToolDefinition['execute'] {
   return async (args: unknown, exec: ToolExecution) => {
-    if (taskRequired) {
-      throw new Error(`Tool "${rawName}" requires task-based execution, which this bridge does not support`)
+    // Register the execution for the whole call so an elicitation the server
+    // raises mid-call can be attributed to this execution's agent.
+    opts.elicitation?.enter(exec)
+    try {
+      return await runToolCall(client, ctx, rawName, taskRequired, opts, projections, args, exec)
+    } finally {
+      opts.elicitation?.exit(exec)
     }
-    // The agent loop passes `JSON.parse(model_arguments)` which is usually an
-    // object, but can be any JSON value if the model misbehaves (outputs a bare
-    // string/number/null). Fallback to {} lets the MCP server produce a
-    // specific "missing required param" error the model can learn from.
-    const argsObj = (typeof args === 'object' && args !== null ? args : {}) as Record<string, unknown>
-    const result = await callToolUncached(client, rawName, argsObj, exec, opts)
+  }
+}
 
-    // The SDK may return a legacy `toolResult` shape; normalize to content array.
-    if (!Array.isArray(result.content)) {
-      const rendered: unknown = 'toolResult' in result
-        ? JSON.stringify(result.toolResult)
-        : '(no output)'
-      const text = typeof rendered === 'string' ? rendered : '(no output)'
-      if (result.isError === true) throw new Error(text)
-      return {
-        content: [{ type: 'text', text }],
-        ...result.structuredContent !== undefined
-          ? { structuredContent: result.structuredContent as JsonValue }
-          : {},
-      }
-    }
+/** One `tools/call` round trip, with its execution already registered for attribution. */
+async function runToolCall(
+  client: Client,
+  ctx: Context,
+  rawName: string,
+  taskRequired: boolean,
+  opts: ToolBridgeOptions,
+  projections: WeakMap<ToolExecution, PreparedProjection>,
+  args: unknown,
+  exec: ToolExecution,
+) {
+  if (taskRequired) {
+    throw new Error(`Tool "${rawName}" requires task-based execution, which this bridge does not support`)
+  }
+  // The agent loop passes `JSON.parse(model_arguments)` which is usually an
+  // object, but can be any JSON value if the model misbehaves (outputs a bare
+  // string/number/null). Fallback to {} lets the MCP server produce a
+  // specific "missing required param" error the model can learn from.
+  const argsObj = (typeof args === 'object' && args !== null ? args : {}) as Record<string, unknown>
+  const result = await callToolUncached(client, rawName, argsObj, exec, opts)
 
-    // Trust boundary: the SDK's return type erases to `any[]` due to the
-    // union of CallToolResult | CompatibilityCallToolResult; extractText
-    // validates each element.
-    const content = result.content as unknown as JsonValue[]
-    const text = extractText(content, rawName)
-
-    // MCP isError → throw so ToolRuntime produces an isError result for the model.
-    if (result.isError === true) {
-      throw new Error(text)
-    }
-
-    const value: McpResult = {
-      content,
+  // The SDK may return a legacy `toolResult` shape; normalize to content array.
+  if (!Array.isArray(result.content)) {
+    const rendered: unknown = 'toolResult' in result
+      ? JSON.stringify(result.toolResult)
+      : '(no output)'
+    const text = typeof rendered === 'string' ? rendered : '(no output)'
+    if (result.isError === true) throw new Error(text)
+    return {
+      content: [{ type: 'text', text }],
       ...result.structuredContent !== undefined
         ? { structuredContent: result.structuredContent as JsonValue }
         : {},
     }
-    if (containsImage(content)) {
-      const fallback: ContentBlock[] = [{ type: 'text', text: extractText(content, rawName) }]
-      const projected = await prepareImageProjection(ctx, exec, content, rawName)
-      projections.set(exec, { value, fallback, content: projected })
-    }
-    return value
   }
+
+  // Trust boundary: the SDK's return type erases to `any[]` due to the
+  // union of CallToolResult | CompatibilityCallToolResult; extractText
+  // validates each element.
+  const content = result.content as unknown as JsonValue[]
+  const text = extractText(content, rawName)
+
+  // MCP isError → throw so ToolRuntime produces an isError result for the model.
+  if (result.isError === true) {
+    throw new Error(text)
+  }
+
+  const value: McpResult = {
+    content,
+    ...result.structuredContent !== undefined
+      ? { structuredContent: result.structuredContent as JsonValue }
+      : {},
+  }
+  if (containsImage(content)) {
+    const fallback: ContentBlock[] = [{ type: 'text', text: extractText(content, rawName) }]
+    const projected = await prepareImageProjection(ctx, exec, content, rawName)
+    projections.set(exec, { value, fallback, content: projected })
+  }
+  return value
 }
 
 /** Whether an untrusted MCP content array contains a declared image block. */

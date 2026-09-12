@@ -59,6 +59,8 @@ Add one entry per server; nothing else is required. After the harness starts, th
 | `command` / `args` / `env` / `cwd` | — | stdio: executable, arguments, extra env merged over scrubbed ambient env, working directory |
 | `url` / `headers` | — | streamable-http: endpoint URL and extra request headers |
 | `toolCallTimeoutMs` | `60,000` | Timeout per `tools/call` invocation |
+| `protocolEra` | `legacy` | Protocol revision to speak: `legacy` (2025 handshake only), `auto` (use 2026-07-28 when the server offers it, otherwise fall back), or `{ pin: '2026-07-28' }` (require it) |
+| `maxRounds` | `10` | Rounds one `tools/call` may spend answering server requests for input before the call fails |
 | `failOnStartupError` | `false` | Reject plugin activation when the initial connection or tool synchronization fails |
 | `reconnect.enabled` | `true` | Reconnect automatically after a lost connection |
 | `reconnect.initialDelayMs` | `500` | First reconnect delay; doubles per consecutive failed attempt |
@@ -85,9 +87,15 @@ When the model calls an MCP tool, the call runs against the remote server with a
 
 Images are supported when the current model accepts image input and the harness attachment feature is enabled; they then appear in the conversation like other images. Otherwise — and for audio or embedded resources — the model sees a clear diagnostic message instead of nothing.
 
+### Server-initiated questions
+
+On the 2026-07-28 revision a server can pause a tool call to ask the human something — a confirmation, a choice, or a short form. The harness presents that through its normal question UI and sends the answer back, and the server resumes the same call. This works whenever the question service is mounted, which the standard harness profiles do.
+
+The bridge answers only the questions a server actually asks. It never declares URL elicitation, which would need a consent and navigation surface no harness client implements, and it never declares the deprecated sampling, roots, or logging capabilities — a server asking for those gets a visible error rather than a silently degraded answer. Skipping or cancelling a question cancels the server's request instead of answering it, and a submission with no values is reported as a decline, so the model never sees an invented answer.
+
 ### Startup, updates, and reconnection
 
-The server's tools appear before the harness starts its first turn. When the server changes its tool list, the model's tool set updates automatically; if the update fails, the previous tool set keeps working.
+The server's tools appear before the harness starts its first turn. When the server changes its tool list, the model's tool set updates automatically; if the update fails, the previous tool set keeps working. The change arrives through the list-change subscription the client opens when the server advertises that capability, so a server that changes its list without advertising it is picked up on the next reconnect or reload.
 
 When a server connection drops — for example a local server process crashes — the plugin reconnects automatically with delays that double from 500 ms up to 30 s and then refreshes the tool set; reconnect progress is visible in the logs. During an outage the last known tools stay listed but calls to them fail until the server recovers. After ten consecutive failed attempts the server's tools are removed and reconnection stops until you reload the configuration or restart the harness; a server that stays connected for a while resets that counter. Set `reconnect.enabled: false` to disable automatic reconnection — tools then stay listed but fail until you reload. Editing the configuration entry reloads the server connection in place, and unchanged names stay unchanged.
 
@@ -104,6 +112,7 @@ This section explains the design decisions behind the bridge and points at the c
 ### Design philosophy
 
 - **Server-qualified identity.** Every MCP tool has the stable identity `(serverName, rawName)`. The namespace is local configuration, never the remote `serverInfo.name` — the remote name is untrusted, not unique across deployments, and can change on upgrade, none of which may silently rename model-facing tools.
+- **The protocol era is configuration, not an upgrade side effect.** A connection speaks the 2025 handshake unless its entry opts in, so upgrading the bridge cannot change what an existing server sees on the wire.
 - **Naming is a pinned contract.** Public names are pure functions of `(serverName, rawName)` and satisfy the DeepSeek function-name contract; lossy normalization appends a 12-hex-char SHA-256 hash so distinct identities never collapse. Session history and permission rules therefore survive HMR swaps, re-syncs, and other servers' changes.
 - **The raw name is the only wire name.** `tools/call` always receives the raw name; the public name is never sent to the server and never parsed to recover the raw name.
 - **Full generation or none.** Syncs swap generations atomically: a fetch failure keeps the previous generation, and a registration conflict rolls back the entire attempted generation.
@@ -116,14 +125,18 @@ This section explains the design decisions behind the bridge and points at the c
 | [`src/index.ts`](src/index.ts) | Plugin entry: `Config` schema, `serverName` reservation, activation await |
 | [`src/connection.ts`](src/connection.ts) | Connection supervisor: client generations, reconnect policy, attempt budget, disposal |
 | [`src/tools.ts`](src/tools.ts) | Tool bridge: discovery, naming, registration swap, execution, image projection |
+| [`src/cache.ts`](src/cache.ts) | `tools/list` descriptor cache partitioned by server namespace and authorization |
+| [`src/elicitation.ts`](src/elicitation.ts) | Form-mode elicitation: question mapping, agent attribution, request handler |
 | [`src/transport.ts`](src/transport.ts) | Transport factory: stdio spawn with scrubbed env, Streamable HTTP |
 | — | No runtime invariant companion is published; MCP generations contribute through the tool registry, but the bridge exposes no independent server-to-tool snapshot after an asynchronous resync. |
 
 ### Lifecycle and sync
 
-`apply` resolves the reconnect policy, reserves the `serverName` inside the current registration scope, starts the supervisor, and awaits the initial connection plus discovery. Independent Agent scopes may reuse the same namespace because their tools and transports are isolated; a duplicate inside one scope fails at load. The supervisor serializes every sync — initial, notification, and reconnect — through one queue so two syncs can never interleave their dispose-previous/register-next swap. Disposal cancels pending reconnects, closes the live client, waits for the in-flight attempt and queued syncs to quiesce, and unregisters the current generation.
+`apply` resolves the reconnect policy and the era, reserves the `serverName` inside the current registration scope, starts the supervisor, and awaits the initial connection plus discovery. Independent Agent scopes may reuse the same namespace because their tools and transports are isolated; a duplicate inside one scope fails at load. Advertised capabilities come from the seams actually mounted — the question service alone, and only in form mode — and the bridge registers its elicitation handler before connecting when that seam exists. The supervisor serializes every sync — initial, list change, and reconnect — through one queue so two syncs can never interleave their dispose-previous/register-next swap. Disposal cancels pending reconnects, closes the live client, waits for the in-flight attempt and queued syncs to quiesce, and unregisters the current generation.
 
-The supervisor listens for `notifications/tools/list_changed` and queues a re-sync; a fetch-phase failure keeps the previous generation registered, while a registration conflict rolls back the attempted generation. Each outage shares one attempt budget: after `maxAttempts` consecutive failures the tools are unregistered and reconnection stops, and a connection that stays up past `maxDelayMs` resets the budget.
+A `tools/list` result on the 2026-07-28 revision carries a freshness window and a sharing scope. The bridge stores the aggregated descriptors — never client-bound definitions — under `(serverName, authorization digest)` and serves them for that window, so a reconnect or a sibling Agent scope reuses one discovery instead of draining pagination again; a list change or disposal evicts the entry. The digest is always part of the key, so a server's `public` scope is honored as "cacheable" and never widened into cross-authorization reuse.
+
+The SDK invokes the bridge's list-changed handler when the server advertises the capability and announces a change; on the 2026-07-28 revision that arrives over the subscription the client opens. The handler evicts the cached list and queues a re-sync; a fetch-phase failure keeps the previous generation registered, while a registration conflict rolls back the attempted generation. Each outage shares one attempt budget: after `maxAttempts` consecutive failures the tools are unregistered and reconnection stops, and a connection that stays up past `maxDelayMs` resets the budget.
 
 ### Tool execution internals
 
@@ -189,6 +202,8 @@ Append-only; newly visible content follows the reusable request prefix and does 
 These limits describe what you cannot do with this plugin and when it needs operational attention. They are current package constraints, not a comparison with other MCP clients or a task backlog.
 
 - **Tools are the only bridged MCP capability** — Resources and Prompts have no harness consumer mechanism and are deferred.
+- **The 2026-07-28 era is opt-in and only partly consumed** — connections use the `initialize` handshake unless `protocolEra` selects the modern revision, and no harness client implements URL elicitation or the deprecated sampling, roots, and logging capabilities, so a server asking for those fails visibly. See the [migration note](../../../.agents/notes/implemented/feature/2026-09-12-mcp-2026-07-28-client-migration.md).
+- **Tool calls from different agents share one question channel per server** — a server-initiated question is attributed to the sole agent with a call in flight on that connection; when calls from different agents are in flight the bridge cancels the question instead of showing it to the wrong agent.
 - **Startup and discovery timeouts are inherited from the MCP SDK** — the plugin exposes no connection or discovery timeout; each `initialize` and paginated `tools/list` request uses the SDK's 60-second request default, so an unresponsive server or cursor chain can delay both activation and teardown while the initial synchronization settles.
 - **Reconnect triggers on transport close** — a crashed stdio child fires it; Streamable HTTP failures surface per request through the SDK transport's own recovery, so an unreachable HTTP server is retried per call rather than respawned by the supervisor.
 - **Image is the only durable rich-result bridge** — PNG, JPEG, WebP, and GIF enter Native context after exact capability proof. Audio and embedded-resource payloads remain execution-local with explicit diagnostics, while resource links preserve only their name and URI as text.

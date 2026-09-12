@@ -7,55 +7,68 @@ import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { createScope } from '@deepseek-ai/dsh-scope'
+import { UserQuestionService } from '@deepseek-ai/dsh-user-questions'
 import type { Config } from '@deepseek-ai/dsh-mcp-client'
 
 // ---- Mock MCP SDK ----
 
 // vi.mock factories are hoisted above every import/const, so the mock fns and
 // class must be created inside vi.hoisted to exist when the factories run.
-const { mockConnect, mockClose, mockListTools, mockCallTool, mockSetNotificationHandler, MockClient } = vi.hoisted(() => {
+const {
+  mockConnect, mockClose, mockListTools, mockCallTool, mockClientOptions,
+  mockSetRequestHandler, mockClientInstances, MockClient,
+} = vi.hoisted(() => {
   const mockConnect = vi.fn<() => Promise<void>>()
   const mockClose = vi.fn<() => Promise<void>>()
   const mockListTools = vi.fn<(_params?: Record<string, unknown>) => Promise<unknown>>()
-  const mockCallTool = vi.fn<(
-    _params?: Record<string, unknown>, _compatibilitySchema?: unknown, _options?: unknown,
-  ) => Promise<unknown>>()
-  const mockSetNotificationHandler = vi.fn()
+  const mockCallTool = vi.fn<(_params?: Record<string, unknown>, _options?: unknown) => Promise<unknown>>()
+  /** Client constructor options, one entry per generation in creation order. */
+  const mockClientOptions = vi.fn()
+  const mockSetRequestHandler = vi.fn()
+  /** Constructed generations, in creation order. */
+  const mockClientInstances: Array<{ onerror: ((error: Error) => void) | undefined }> = []
   const mockRequest = vi.fn(async (
     request: { method: string; params?: Record<string, unknown> },
-    _schema: unknown,
+    _schemaOrOptions?: unknown,
     options?: unknown,
   ): Promise<unknown> => {
     if (request.method === 'tools/list') return await mockListTools(request.params)
-    if (request.method === 'tools/call') return await mockCallTool(request.params, undefined, options)
+    if (request.method === 'tools/call') return await mockCallTool(request.params, options)
     throw new Error(`unexpected MCP request: ${request.method}`)
   })
   class MockClient {
+    onclose: (() => void) | undefined
+    onerror: ((error: Error) => void) | undefined
+    constructor(_info?: unknown, options?: unknown) {
+      mockClientOptions(_info, options)
+      mockClientInstances.push(this)
+    }
     connect = mockConnect
     close = mockClose
     listTools = mockListTools
     callTool = mockCallTool
     request = mockRequest
-    setNotificationHandler = mockSetNotificationHandler
+    setRequestHandler = mockSetRequestHandler
   }
-  return { mockConnect, mockClose, mockListTools, mockCallTool, mockSetNotificationHandler, MockClient }
+  return {
+    mockConnect, mockClose, mockListTools, mockCallTool, mockClientOptions, mockSetRequestHandler, mockClientInstances, MockClient,
+  }
 })
 
-vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
+vi.mock('@modelcontextprotocol/client', () => ({
   Client: MockClient,
-}))
-
-vi.mock('@modelcontextprotocol/sdk/client/stdio.js', () => ({
-  StdioClientTransport: vi.fn(),
-}))
-
-vi.mock('@modelcontextprotocol/sdk/client/streamableHttp.js', () => ({
   StreamableHTTPClientTransport: vi.fn(),
+}))
+
+vi.mock('@modelcontextprotocol/client/stdio', () => ({
+  StdioClientTransport: vi.fn(),
 }))
 
 // vi.mock is hoisted above static imports, so the module under test sees the
 // mocked SDK even through a static import.
 import { apply, name, inject, Config as ConfigSchema } from '@deepseek-ai/dsh-mcp-client/src/index.ts'
+import { toolListCache } from '@deepseek-ai/dsh-mcp-client/src/cache.ts'
+import { resolveProtocolEra } from '@deepseek-ai/dsh-mcp-client/src/connection.ts'
 
 // ---- Helpers ----
 
@@ -84,6 +97,26 @@ const stdioConfig: Config = {
   cwd: '',
   toolCallTimeoutMs: 60_000,
   failOnStartupError: false,
+}
+
+/** Client constructor options the bridge passed for generation `index`. */
+function generationOptions(index = 0): {
+  capabilities: unknown
+  versionNegotiation?: unknown
+  inputRequired: { maxRounds: number }
+  listChanged: { tools: { autoRefresh: boolean; debounceMs: number; onChanged: () => void } }
+} {
+  return mockClientOptions.mock.calls[index]![1] as ReturnType<typeof generationOptions>
+}
+
+/** Fire the SDK's list-changed callback for generation `index`. */
+function fireToolsChanged(index = 0): void {
+  generationOptions(index).listChanged.tools.onChanged()
+}
+
+/** The constructed client generation at `index`, for post-construction handlers. */
+function clientInstance(index = 0): { onerror: ((error: Error) => void) | undefined } {
+  return mockClientInstances[index]!
 }
 
 // ---- Tests ----
@@ -152,6 +185,55 @@ describe('mcp-client plugin module exports', () => {
       reconnect: { maxAttempts: 0 },
     } as never)).toThrow()
   })
+
+  it('Config schema defaults the protocol era to legacy and rounds to the SDK default', () => {
+    const omitted = ConfigSchema({
+      transport: 'stdio',
+      serverName: 'srv',
+      command: 'echo',
+    } as never)
+    expect(omitted.protocolEra).toBe('legacy')
+    expect(omitted.maxRounds).toBe(10)
+
+    const pinned = ConfigSchema({
+      transport: 'stdio',
+      serverName: 'srv',
+      command: 'echo',
+      protocolEra: { pin: '2026-07-28' },
+      maxRounds: 3,
+    } as never)
+    expect(pinned.protocolEra).toEqual({ pin: '2026-07-28' })
+    expect(pinned.maxRounds).toBe(3)
+
+    const auto = ConfigSchema({
+      transport: 'stdio',
+      serverName: 'srv',
+      command: 'echo',
+      protocolEra: 'auto',
+    } as never)
+    expect(auto.protocolEra).toBe('auto')
+  })
+
+  it('Config schema rejects an unknown era or a non-positive round bound', () => {
+    expect(() => ConfigSchema({
+      transport: 'stdio',
+      serverName: 'srv',
+      command: 'echo',
+      protocolEra: { pin: 7 },
+    } as never)).toThrow()
+    expect(() => ConfigSchema({
+      transport: 'stdio',
+      serverName: 'srv',
+      command: 'echo',
+      protocolEra: 'modern',
+    } as never)).toThrow()
+    expect(() => ConfigSchema({
+      transport: 'stdio',
+      serverName: 'srv',
+      command: 'echo',
+      maxRounds: 0,
+    } as never)).toThrow()
+  })
 })
 
 describe('apply (plugin lifecycle)', () => {
@@ -159,6 +241,8 @@ describe('apply (plugin lifecycle)', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks()
+    mockClientInstances.length = 0
+    toolListCache.clear()
     mockConnect.mockResolvedValue(undefined)
     mockClose.mockImplementation(function (this: { onclose?: () => void }) {
       this.onclose?.()
@@ -172,14 +256,80 @@ describe('apply (plugin lifecycle)', () => {
     ctx = await mountRegistry()
   })
 
-  it('connects, syncs tools under the namespace, and registers a notification handler', async () => {
+  it('connects, syncs tools under the namespace, and wires the SDK list-changed callback', async () => {
     await apply(ctx, stdioConfig)
 
     expect(mockConnect).toHaveBeenCalled()
     expect(mockListTools).toHaveBeenCalled()
-    expect(mockSetNotificationHandler).toHaveBeenCalled()
+    const options = generationOptions()
+    // No `userQuestions` seam is mounted, so nothing server-initiated is declared.
+    expect(options.capabilities).toEqual({})
+    // The bridge never lets the SDK auto-aggregate tools/list.
+    expect(options.listChanged.tools).toMatchObject({ autoRefresh: false, debounceMs: 0 })
+    expect(options.inputRequired).toEqual({ maxRounds: 10 })
+    // Legacy era: no negotiation options, byte-identical to a 2025 client.
+    expect(options.versionNegotiation).toBeUndefined()
+    expect(mockSetRequestHandler).not.toHaveBeenCalled()
     expect(ctx.tools.get('mcp__srv__remote')).toBeDefined()
     expect(ctx.tools.get('remote')).toBeUndefined()
+  })
+
+  it('declares elicitation and registers its handler only when the seam is mounted', async () => {
+    await ctx.plugin(UserQuestionService)
+
+    await apply(ctx, stdioConfig)
+
+    expect(generationOptions().capabilities).toEqual({ elicitation: { form: {} } })
+    expect(mockSetRequestHandler).toHaveBeenCalledWith('elicitation/create', expect.any(Function))
+    // Registered before connect so no dispatch can precede the handler.
+    expect(mockSetRequestHandler.mock.invocationCallOrder[0]!)
+      .toBeLessThan(mockConnect.mock.invocationCallOrder[0]!)
+  })
+
+  it('passes auto negotiation and the configured round bound to the SDK client', async () => {
+    await apply(ctx, { ...stdioConfig, protocolEra: 'auto', maxRounds: 3 })
+
+    const options = generationOptions()
+    expect(options.versionNegotiation).toEqual({ mode: 'auto' })
+    expect(options.inputRequired).toEqual({ maxRounds: 3 })
+  })
+
+  it('passes an exact modern pin to the SDK client', async () => {
+    await apply(ctx, { ...stdioConfig, protocolEra: { pin: '2026-07-28' } })
+
+    expect(generationOptions().versionNegotiation).toEqual({ mode: { pin: '2026-07-28' } })
+  })
+
+  it('rejects an unsupported pinned era at load before connecting', async () => {
+    await expect(apply(ctx, { ...stdioConfig, protocolEra: { pin: '2026-01-01' } }))
+      .rejects.toThrow(/protocolEra\.pin must be one of '2026-07-28'/)
+    expect(mockConnect).not.toHaveBeenCalled()
+  })
+
+  it('rejects a non-positive round bound at load before connecting', async () => {
+    await expect(apply(ctx, { ...stdioConfig, maxRounds: 0 }))
+      .rejects.toThrow(/maxRounds must be a positive integer/)
+    expect(mockConnect).not.toHaveBeenCalled()
+  })
+
+  it('rejects a malformed era value that bypassed the schema', () => {
+    expect(() => resolveProtocolEra('bogus' as never, 'mcp-client(srv)'))
+      .toThrow(/protocolEra must be 'legacy', 'auto', or \{ pin: '<revision>' \}/)
+  })
+
+  it('logs a generation error and stops logging once disposed', async () => {
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
+    await apply(ctx, stdioConfig)
+
+    const generation = clientInstance()
+    expect(generation.onerror).toBeTypeOf('function')
+    generation.onerror!(new Error('transport hiccup'))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('client error: Error: transport hiccup'))
+
+    await ctx.fiber.dispose()
+    warn.mockClear()
+    generation.onerror!(new Error('after dispose'))
+    expect(warn).not.toHaveBeenCalled()
   })
 
   it('keeps the Cordis plugin loading until initial discovery publishes its tools', async () => {
@@ -337,8 +487,7 @@ describe('apply (plugin lifecycle)', () => {
       execute: async () => 'foreign',
     })
     mockConnect.mockImplementation(async () => {
-      const handler = mockSetNotificationHandler.mock.calls[0]![1] as () => Promise<void>
-      await handler()
+      fireToolsChanged()
     })
 
     await expect(apply(ctx, {
@@ -351,31 +500,34 @@ describe('apply (plugin lifecycle)', () => {
     await ctx.fiber.dispose()
   })
 
-  it('re-syncs tools on ToolListChanged notification', async () => {
+  it('re-syncs tools on a list-changed signal', async () => {
     await apply(ctx, stdioConfig)
 
     expect(ctx.tools.get('mcp__srv__remote')).toBeDefined()
+    const before = mockListTools.mock.calls.length
 
     mockListTools.mockResolvedValue({
       tools: [{ name: 'updated', inputSchema: { type: 'object' } }],
       nextCursor: undefined,
     })
 
-    const handler = mockSetNotificationHandler.mock.calls[0]![1] as () => Promise<void>
-    await handler()
+    fireToolsChanged()
+    await vi.waitFor(() => { expect(ctx.tools.get('mcp__srv__updated')).toBeDefined() })
 
+    expect(mockListTools.mock.calls.length).toBe(before + 1)
     expect(ctx.tools.get('mcp__srv__remote')).toBeUndefined()
-    expect(ctx.tools.get('mcp__srv__updated')).toBeDefined()
   })
 
   it('keeps the previous generation when a re-sync fails', async () => {
     await apply(ctx, stdioConfig)
     expect(ctx.tools.get('mcp__srv__remote')).toBeDefined()
+    const before = mockListTools.mock.calls.length
 
     mockListTools.mockRejectedValue(new Error('flaky server'))
-    const handler = mockSetNotificationHandler.mock.calls[0]![1] as () => Promise<void>
+    fireToolsChanged()
     // Must not reject (contained), and must keep the last good generation.
-    await handler()
+    await vi.waitFor(() => { expect(mockListTools.mock.calls.length).toBe(before + 1) })
+    await sleep(0)
 
     expect(ctx.tools.get('mcp__srv__remote')).toBeDefined()
   })
@@ -383,22 +535,23 @@ describe('apply (plugin lifecycle)', () => {
   it('continues notification synchronization after rejecting a pagination cycle', async () => {
     try {
       await apply(ctx, stdioConfig)
-      const handler = mockSetNotificationHandler.mock.calls[0]![1] as () => Promise<void>
+      const before = mockListTools.mock.calls.length
       mockListTools
         .mockResolvedValueOnce({ tools: [], nextCursor: 'cursor1' })
         .mockResolvedValueOnce({ tools: [], nextCursor: 'cursor1' })
         .mockRejectedValue(new Error('pagination continued after the repeated cursor'))
 
-      await handler()
-      expect(mockListTools).toHaveBeenCalledTimes(3)
+      fireToolsChanged()
+      await vi.waitFor(() => { expect(mockListTools.mock.calls.length).toBe(before + 2) })
+      await sleep(0)
       expect(ctx.tools.get('mcp__srv__remote')).toBeDefined()
 
       mockListTools
         .mockResolvedValueOnce({ tools: [], nextCursor: 'cursor1' })
         .mockResolvedValueOnce({ tools: [{ name: 'updated', inputSchema: { type: 'object' } }], nextCursor: undefined })
-      await handler()
+      fireToolsChanged()
+      await vi.waitFor(() => { expect(ctx.tools.get('mcp__srv__updated')).toBeDefined() })
       expect(ctx.tools.get('mcp__srv__remote')).toBeUndefined()
-      expect(ctx.tools.get('mcp__srv__updated')).toBeDefined()
     } finally {
       await ctx.fiber.dispose()
     }
@@ -416,9 +569,8 @@ describe('apply (plugin lifecycle)', () => {
       tools: [{ name: 'updated', inputSchema: { type: 'object' } }],
       nextCursor: undefined,
     })
-    const handler = mockSetNotificationHandler.mock.calls[0]![1] as () => Promise<void>
-    await handler()
-    expect(ctx.tools.get('mcp__srv__updated')).toBeDefined()
+    fireToolsChanged()
+    await vi.waitFor(() => { expect(ctx.tools.get('mcp__srv__updated')).toBeDefined() })
 
     await fiber.dispose()
     await sleep(50)

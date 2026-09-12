@@ -1,6 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
-import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
+import { Client, InMemoryTransport } from '@modelcontextprotocol/client'
 import { Context } from '@deepseek-ai/cordis'
 import AttachmentStore, { AttachmentError, AttachmentId } from '@deepseek-ai/dsh-attachment'
 import type { ImageAttachmentLimits, ImageAttachmentRef, SaveImageAttachment, StoredImageAttachment } from '@deepseek-ai/dsh-attachment'
@@ -39,7 +38,6 @@ function createMockClient(tools: MockTool[], callResult: MockCallResult = { cont
   ): Promise<{ tools: MockTool[]; nextCursor: string | undefined }> => ({ tools, nextCursor: undefined }))
   const callTool = vi.fn(async (
     _params?: Record<string, unknown>,
-    _compatibilitySchema?: unknown,
     _options?: unknown,
   ): Promise<Record<string, unknown>> => ({ ...callResult }))
   return {
@@ -47,14 +45,13 @@ function createMockClient(tools: MockTool[], callResult: MockCallResult = { cont
     callTool,
     request: vi.fn(async (
       request: { method: string; params?: Record<string, unknown> },
-      _schema: unknown,
+      _schemaOrOptions?: unknown,
       options?: unknown,
     ): Promise<unknown> => {
       if (request.method === 'tools/list') return listTools(request.params)
-      if (request.method === 'tools/call') return callTool(request.params, undefined, options)
+      if (request.method === 'tools/call') return callTool(request.params, options)
       throw new Error(`unexpected MCP request: ${request.method}`)
     }),
-    setNotificationHandler: vi.fn(),
     connect: vi.fn().mockResolvedValue(undefined),
     close: vi.fn().mockResolvedValue(undefined),
   }
@@ -148,6 +145,7 @@ const defaultOpts: ToolBridgeOptions = {
   registrationFailure: 'contain',
   serverName: 'srv',
   toolCallTimeoutMs: 60_000,
+  authorization: 'test',
 }
 
 // ---- Tests ----
@@ -453,8 +451,9 @@ describe('tool execution', () => {
     // The wire sees the raw MCP name, never the public name.
     expect(client.callTool).toHaveBeenCalledWith(
       { name: 'echo', arguments: { msg: 'hi' } },
-      undefined,
-      expect.objectContaining({ timeout: 60_000 }),
+      // `maxTotalTimeout` bounds the whole multi-round-trip flow to the same
+      // configured budget rather than restarting it per round.
+      expect.objectContaining({ timeout: 60_000, maxTotalTimeout: 60_000 }),
     )
   })
 
@@ -471,7 +470,6 @@ describe('tool execution', () => {
     expect(result.isError).toBe(false)
     expect(client.callTool).toHaveBeenCalledWith(
       { name: 'admin.reset', arguments: {} },
-      undefined,
       expect.anything(),
     )
   })
@@ -917,7 +915,6 @@ describe('tool execution', () => {
 
     expect(client.callTool).toHaveBeenCalledWith(
       expect.anything(),
-      undefined,
       expect.objectContaining({ signal: controller.signal }),
     )
   })
@@ -1277,7 +1274,6 @@ describe('tool execution — non-object args fallback', () => {
 
     expect(client.callTool).toHaveBeenCalledWith(
       { name: 'coerce', arguments: {} },
-      undefined,
       expect.anything(),
     )
   })
@@ -1293,7 +1289,6 @@ describe('tool execution — non-object args fallback', () => {
 
     expect(client.callTool).toHaveBeenCalledWith(
       { name: 'coerce2', arguments: {} },
-      undefined,
       expect.anything(),
     )
   })

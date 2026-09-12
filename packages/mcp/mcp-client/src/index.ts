@@ -17,7 +17,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { scopeOf } from '@deepseek-ai/dsh-scope'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
-import { RECONNECT_DEFAULTS, resolveReconnectPolicy, startConnection } from './connection.ts'
+import { DEFAULT_MAX_ROUNDS, RECONNECT_DEFAULTS, resolveConnectionBehavior, resolveReconnectPolicy, startConnection } from './connection.ts'
 import type { ReconnectConfig } from './connection.ts'
 // Side-effect type import: declaration-merges `ctx.tools` onto Context.
 import type {} from '@deepseek-ai/dsh-tools'
@@ -36,6 +36,21 @@ const DEFAULT_TOOL_CALL_TIMEOUT_MS = 60_000
 
 /** Valid `serverName`, kept below the public tool-name budget. */
 const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
+
+/**
+ * Which protocol era one connection may speak.
+ *
+ * - `'legacy'` — the `initialize` handshake only, byte-identical to a 2025
+ *   client (the default).
+ * - `'auto'` — probe `server/discover`, use the modern era on definitive
+ *   modern evidence, and fall back to the handshake otherwise.
+ * - `{ pin: '<revision>' }` — require exactly that modern revision, with no
+ *   fallback.
+ */
+export type ProtocolEraConfig = 'legacy' | 'auto' | {
+  /** Modern protocol revision the connection must use, for example `2026-07-28`. */
+  pin: string
+}
 
 /**
  * Live `serverName` reservations per registration scope. Agent-scoped MCP
@@ -66,6 +81,13 @@ export interface StdioConfig {
   cwd: string
   /** Per-tool-call timeout in milliseconds. */
   toolCallTimeoutMs: number
+  /** Protocol eras this connection may speak; omission keeps the legacy handshake. */
+  protocolEra?: ProtocolEraConfig
+  /**
+   * Maximum multi-round-trip rounds one `tools/call` may spend fulfilling
+   * embedded requests before failing; omission uses the SDK default.
+   */
+  maxRounds?: number
   /** Fail plugin activation when the initial connection or tool synchronization fails. */
   failOnStartupError: boolean
   /** Automatic reconnect policy after a lost connection; omission uses the defaults. */
@@ -88,6 +110,13 @@ export interface StreamableHttpConfig {
   headers: Record<string, string>
   /** Per-tool-call timeout in milliseconds. */
   toolCallTimeoutMs: number
+  /** Protocol eras this connection may speak; omission keeps the legacy handshake. */
+  protocolEra?: ProtocolEraConfig
+  /**
+   * Maximum multi-round-trip rounds one `tools/call` may spend fulfilling
+   * embedded requests before failing; omission uses the SDK default.
+   */
+  maxRounds?: number
   /** Fail plugin activation when the initial connection or tool synchronization fails. */
   failOnStartupError: boolean
   /** Automatic reconnect policy after a lost connection; omission uses the defaults. */
@@ -97,11 +126,18 @@ export interface StreamableHttpConfig {
 /** Configuration for one stdio or Streamable HTTP MCP server. */
 export type Config = StdioConfig | StreamableHttpConfig
 
-type StdioConfigInput = Omit<StdioConfig, 'args' | 'env' | 'cwd' | 'toolCallTimeoutMs' | 'failOnStartupError'>
-  & Partial<Pick<StdioConfig, 'args' | 'env' | 'cwd' | 'toolCallTimeoutMs' | 'failOnStartupError'>>
-type StreamableHttpConfigInput = Omit<StreamableHttpConfig, 'headers' | 'toolCallTimeoutMs' | 'failOnStartupError'>
-  & Partial<Pick<StreamableHttpConfig, 'headers' | 'toolCallTimeoutMs' | 'failOnStartupError'>>
+type StdioConfigInput = Omit<StdioConfig, 'args' | 'env' | 'cwd' | 'toolCallTimeoutMs' | 'protocolEra' | 'maxRounds' | 'failOnStartupError'>
+  & Partial<Pick<StdioConfig, 'args' | 'env' | 'cwd' | 'toolCallTimeoutMs' | 'protocolEra' | 'maxRounds' | 'failOnStartupError'>>
+type StreamableHttpConfigInput = Omit<StreamableHttpConfig, 'headers' | 'toolCallTimeoutMs' | 'protocolEra' | 'maxRounds' | 'failOnStartupError'>
+  & Partial<Pick<StreamableHttpConfig, 'headers' | 'toolCallTimeoutMs' | 'protocolEra' | 'maxRounds' | 'failOnStartupError'>>
 type ConfigInput = StdioConfigInput | StreamableHttpConfigInput
+
+/** Era negotiation accepted from `cordis.yml`; `protect` rejects unknown members. */
+const ProtocolEra: z<ProtocolEraConfig> = z.union([
+  z.const('legacy'),
+  z.const('auto'),
+  z.object({ pin: z.string().required() }),
+])
 
 const Reconnect: z<ReconnectConfig> = z.object({
   enabled: z.boolean().default(RECONNECT_DEFAULTS.enabled),
@@ -119,6 +155,8 @@ export const Config = z.union([
     env: z.dict(String).default({}),
     cwd: z.string().default(''),
     toolCallTimeoutMs: z.number().default(DEFAULT_TOOL_CALL_TIMEOUT_MS),
+    protocolEra: ProtocolEra.default('legacy'),
+    maxRounds: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_ROUNDS),
     failOnStartupError: z.boolean().default(false),
     reconnect: Reconnect,
   }),
@@ -128,6 +166,8 @@ export const Config = z.union([
     url: z.string().required(),
     headers: z.dict(String).default({}),
     toolCallTimeoutMs: z.number().default(DEFAULT_TOOL_CALL_TIMEOUT_MS),
+    protocolEra: ProtocolEra.default('legacy'),
+    maxRounds: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_ROUNDS),
     failOnStartupError: z.boolean().default(false),
     reconnect: Reconnect,
   }),
@@ -148,6 +188,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // construction that bypassed Schemastery) rejects THIS instance before any
   // effect registers.
   const reconnect = resolveReconnectPolicy(config.reconnect, `mcp-client(${config.serverName}): reconnect`)
+  const behavior = resolveConnectionBehavior(config, `mcp-client(${config.serverName})`)
 
   // Reserve the namespace next: a duplicate `serverName` fails THIS instance
   // at load with an actionable error and leaves the earlier instance intact.
@@ -170,7 +211,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // The supervisor owns the client/transport generations, the reconnect
   // loop, and the live tool registrations; disposal stops reconnection,
   // quiesces in-flight work, and unregisters the current generation.
-  const connection = startConnection(ctx, config, reconnect)
+  const connection = startConnection(ctx, config, reconnect, behavior)
 
   ctx.effect(() => {
     return () => connection.dispose()

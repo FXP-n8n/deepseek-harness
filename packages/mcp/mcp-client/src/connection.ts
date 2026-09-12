@@ -15,14 +15,26 @@
  * @module
  */
 
-import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js'
+import { Client } from '@modelcontextprotocol/client'
+import type { ClientCapabilities, VersionNegotiationOptions } from '@modelcontextprotocol/client'
 import type { Context } from '@deepseek-ai/cordis'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
+import { authorizationDigest, toolListCache } from './cache.ts'
+import { ElicitationBroker, registerElicitation } from './elicitation.ts'
 import { createTransport } from './transport.ts'
 import { syncTools } from './tools.ts'
 import type { ToolBridgeOptions, ToolDisposers } from './tools.ts'
-import type { Config } from './index.ts'
+import type { Config, ProtocolEraConfig } from './index.ts'
+
+/** Default bound on multi-round-trip rounds per call, matching the SDK default. */
+export const DEFAULT_MAX_ROUNDS = 10
+
+/**
+ * Modern protocol revisions a deployment may pin. A pinned revision must be
+ * one this bridge and its SDK actually speak, so a typo fails at load rather
+ * than in the reconnect loop.
+ */
+const PINNABLE_PROTOCOL_VERSIONS: readonly string[] = ['2026-07-28']
 
 /** Automatic reconnect policy for one MCP server connection. */
 export interface ReconnectConfig {
@@ -89,6 +101,73 @@ export function resolveReconnectPolicy(config: ReconnectConfig | undefined, path
   return Object.freeze({ enabled, initialDelayMs, maxDelayMs, maxAttempts })
 }
 
+/** Era negotiation and multi-round-trip bounds for one plugin instance. */
+export interface ResolvedConnectionBehavior {
+  /** SDK negotiation options; `undefined` keeps the legacy handshake. */
+  readonly protocolEra: VersionNegotiationOptions | undefined
+  /** Maximum multi-round-trip rounds one `tools/call` may spend. */
+  readonly maxRounds: number
+}
+
+/**
+ * Translate the configured protocol era into SDK negotiation options.
+ *
+ * @param value - Raw `protocolEra` config; omission keeps the legacy handshake.
+ * @param path - Diagnostic prefix naming the config location in thrown messages.
+ * @returns Negotiation options, or undefined for the legacy era.
+ */
+export function resolveProtocolEra(value: ProtocolEraConfig | undefined, path: string): VersionNegotiationOptions | undefined {
+  if (value === undefined || value === 'legacy') return undefined
+  if (value === 'auto') return { mode: 'auto' }
+  if (typeof value !== 'object' || typeof value.pin !== 'string') {
+    throw new Error(`${path}.protocolEra must be 'legacy', 'auto', or { pin: '<revision>' }`)
+  }
+  if (!PINNABLE_PROTOCOL_VERSIONS.includes(value.pin)) {
+    throw new Error(`${path}.protocolEra.pin must be one of ${PINNABLE_PROTOCOL_VERSIONS.map(revision => `'${revision}'`).join(', ')}`)
+  }
+  return { mode: { pin: value.pin } }
+}
+
+/**
+ * Validate the multi-round-trip round bound.
+ *
+ * @param value - Raw `maxRounds` config; omission uses the SDK default.
+ * @param path - Diagnostic prefix naming the config location in thrown messages.
+ * @returns The positive integer round bound.
+ */
+export function resolveMaxRounds(value: number | undefined, path: string): number {
+  if (value === undefined) return DEFAULT_MAX_ROUNDS
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`${path}.maxRounds must be a positive integer`)
+  }
+  return value
+}
+
+/**
+ * The one explicit resolve step from raw era and round config to the behavior
+ * the supervisor runs. Programmatic construction may bypass Schemastery
+ * normalization, so every bound is re-judged here — misconfiguration fails the
+ * plugin instance at load.
+ *
+ * @param config - Resolved plugin config.
+ * @param path - Diagnostic prefix naming the config location in thrown messages.
+ * @returns The frozen resolved behavior.
+ */
+export function resolveConnectionBehavior(config: Config, path: string): ResolvedConnectionBehavior {
+  return Object.freeze({
+    protocolEra: resolveProtocolEra(config.protocolEra, path),
+    maxRounds: resolveMaxRounds(config.maxRounds, path),
+  })
+}
+
+/** Capabilities the bridge advertises, derived from the seams actually mounted. */
+function advertiseCapabilities(ctx: Context): ClientCapabilities {
+  // Elicitation is the only server-initiated interaction the bridge fulfils,
+  // and only the `userQuestions` seam can present it. Roots, sampling, and
+  // logging are deprecated as of 2026-07-28 and never declared.
+  return ctx.get('userQuestions') === undefined ? {} : { elicitation: { form: {} } }
+}
+
 /** Result from the initial connection attempt, for startup-await semantics. */
 export interface ConnectionOutcome {
   /** If the initial connection or tool sync failed, the error; otherwise absent. */
@@ -118,21 +197,24 @@ export interface ConnectionHandle {
  * @param ctx - Cordis context providing the `tools` registry and logger.
  * @param config - Resolved plugin config selecting the transport and server identity.
  * @param policy - Resolved reconnect policy from {@link resolveReconnectPolicy}.
+ * @param behavior - Resolved era and round bounds; omission resolves them here.
  * @returns Handle with a `ready` promise for startup-await and a `dispose` for teardown.
  */
-export function startConnection(ctx: Context, config: Config, policy: ResolvedReconnectPolicy): ConnectionHandle {
+export function startConnection(
+  ctx: Context,
+  config: Config,
+  policy: ResolvedReconnectPolicy,
+  behavior?: ResolvedConnectionBehavior,
+): ConnectionHandle {
   const label = `mcp-client(${config.serverName})`
+  const resolved = behavior ?? resolveConnectionBehavior(config, label)
+  const authorization = authorizationDigest(config)
   const opts: ToolBridgeOptions = {
     registrationFailure: 'contain',
     serverName: config.serverName,
     toolCallTimeoutMs: config.toolCallTimeoutMs,
+    authorization,
   }
-  // The initial sync uses 'throw' when failOnStartupError is configured, so
-  // a registration conflict propagates to the startup-await path. Re-syncs
-  // and reconnect syncs always contain conflicts.
-  const startupOpts: ToolBridgeOptions = config.failOnStartupError
-    ? { ...opts, registrationFailure: 'throw' }
-    : opts
 
   let disposed = false
   /** Current generation: the connecting or connected client; undefined during backoff waits and after final failure. */
@@ -235,10 +317,45 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
    * @param startup - Whether this is the plugin's activation attempt.
    */
   async function connectGeneration(startup: boolean): Promise<void> {
+    const userQuestionsMounted = ctx.get('userQuestions') !== undefined
+    const broker = new ElicitationBroker()
+    // One broker per generation: the elicitation handler is bound to the client
+    // that dispatches it, and a reconnect must not inherit stale executions.
+    const generationOpts: ToolBridgeOptions = {
+      ...opts,
+      ...userQuestionsMounted ? { elicitation: broker } : {},
+    }
+    const startupGenerationOpts: ToolBridgeOptions = config.failOnStartupError
+      ? { ...generationOpts, registrationFailure: 'throw' }
+      : generationOpts
+    /** Re-sync after the SDK's list-changed signal; the cache is stale by definition. */
+    function onToolsChanged(changed: Client): void {
+      if (!isCurrent(changed)) return
+      ctx.logger.info(`${label}: tool list changed, re-syncing`)
+      toolListCache.evictServer(config.serverName)
+      void enqueueSync(changed, generationOpts).catch((error: unknown) => {
+        // Fetch-phase failure: the previous generation is still registered and
+        // `disposers` still owns it — keep serving the last good list.
+        if (!disposed) ctx.logger.error(`${label}: tool re-sync failed: ${String(error)}`)
+      })
+    }
     const generation = new Client(
       { name: 'dsh-mcp-client', version: '0.0.1' },
-      { capabilities: {} },
+      {
+        capabilities: advertiseCapabilities(ctx),
+        ...resolved.protocolEra === undefined ? {} : { versionNegotiation: resolved.protocolEra },
+        inputRequired: { maxRounds: resolved.maxRounds },
+        // `autoRefresh: false` keeps the SDK from auto-aggregating tools/list
+        // and writing its response cache; the bridge owns pagination and
+        // re-syncs through its own per-page path. On a modern connection the
+        // SDK backs this with an auto-opened `subscriptions/listen` stream.
+        listChanged: { tools: { autoRefresh: false, debounceMs: 0, onChanged: () => { onToolsChanged(generation) } } },
+      },
     )
+    generation.onerror = (error) => {
+      if (!disposed) ctx.logger.warn(`${label}: client error: ${String(error)}`)
+    }
+    if (userQuestionsMounted) registerElicitation(generation, ctx, broker, label)
     const closed: PromiseWithResolvers<void> = Promise.withResolvers()
     let attemptSettled = false
     let closeObserved = false
@@ -252,22 +369,6 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
       // established generation can transition down directly from this signal.
       if (attemptSettled) generationDown(generation)
     }
-    // Registered before connect so a list change during the initial sync is
-    // queued behind it rather than dropped.
-    generation.setNotificationHandler(
-      ToolListChangedNotificationSchema,
-      async () => {
-        if (!isCurrent(generation)) return
-        ctx.logger.info(`${label}: tool list changed, re-syncing`)
-        try {
-          await enqueueSync(generation)
-        } catch (error) {
-          // Fetch-phase failure: the previous generation is still registered
-          // and `disposers` still owns it — keep serving the last good list.
-          if (!disposed) ctx.logger.error(`${label}: tool re-sync failed: ${String(error)}`)
-        }
-      },
-    )
     try {
       await generation.connect(createTransport(config))
       if (hasClosed()) {
@@ -275,7 +376,7 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
         generationDown(generation)
         return
       }
-      await enqueueSync(generation, startup ? startupOpts : opts)
+      await enqueueSync(generation, startup ? startupGenerationOpts : generationOpts)
     } catch (error) {
       if (firstAttemptError === undefined) firstAttemptError = error
       // Disposal clears current ownership before it closes the generation, so
@@ -346,6 +447,9 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
       await syncChain
       for (const dispose of disposers.values()) dispose()
       disposers = new Map()
+      // A disposed instance owns no live authorization context, so its cached
+      // tool lists must not outlive it.
+      toolListCache.evictServer(config.serverName)
     },
   }
 }

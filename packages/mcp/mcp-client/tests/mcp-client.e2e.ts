@@ -1,9 +1,10 @@
 /**
  * End-to-end tests for dsh-mcp-client. Exercises the REAL MCP protocol against:
- * 1. A self-written fixture server over stdio (controlled edge cases)
- * 2. @modelcontextprotocol/server-everything (official integration test server)
- * 3. @modelcontextprotocol/server-filesystem (real filesystem operations)
- * 4. An in-process StreamableHTTPServerTransport server over Streamable HTTP
+ * 1. A self-written 2025-era fixture server over stdio (controlled edge cases)
+ * 2. A v2 `serveStdio` fixture serving the 2026-07-28 era over stdio
+ * 3. @modelcontextprotocol/server-everything (official integration test server)
+ * 4. @modelcontextprotocol/server-filesystem (real filesystem operations)
+ * 5. An in-process StreamableHTTPServerTransport server over Streamable HTTP
  *
  * No API key needed — all servers are local/keyless.
  */
@@ -22,15 +23,19 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import LocalAttachmentStore from '@deepseek-ai/dsh-attachment-local'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
+import { UserQuestionService } from '@deepseek-ai/dsh-user-questions'
+import type { AskUserQuestionRequest } from '@deepseek-ai/dsh-user-questions'
 import { ToolCallId, LlmAdapter, LlmRuntime } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { apply } from '@deepseek-ai/dsh-mcp-client/src/index.ts'
+import { toolListCache } from '@deepseek-ai/dsh-mcp-client/src/cache.ts'
 import { publicToolName } from '@deepseek-ai/dsh-mcp-client/src/tools.ts'
 import type { Config } from '@deepseek-ai/dsh-mcp-client'
 
 const testToolSignal = new AbortController().signal
 
 const fixtureServerPath = fileURLToPath(new URL('./fixture-server.ts', import.meta.url))
+const modernFixtureServerPath = fileURLToPath(new URL('./modern-fixture-server.ts', import.meta.url))
 
 // Resolve package-local .bin for pnpm-hoisted MCP server binaries.
 const packageDir = fileURLToPath(new URL('..', import.meta.url))
@@ -560,4 +565,167 @@ describe('streamable-http — in-process MCP server', () => {
     expect(seenAuth.length).toBeGreaterThan(0)
     for (const auth of seenAuth) expect(auth).toBe('Bearer e2e-test-token')
   })
+})
+
+// ---- 2026-07-28 era: the v2 stdio fixture ----
+
+/** stdio config for the v2 fixture; omission of `protocolEra` keeps the legacy handshake. */
+function modernFixtureConfig(serverName: string, env: Record<string, string> = {}): Config {
+  return {
+    transport: 'stdio',
+    serverName,
+    command: process.execPath,
+    args: [modernFixtureServerPath],
+    env,
+    cwd: packageDir,
+    toolCallTimeoutMs: 15_000,
+    failOnStartupError: false,
+  }
+}
+
+describe('2026-07-28 era — v2 fixture server', () => {
+  let ctx: Context
+
+  beforeAll(async () => {
+    ctx = await mountRegistry()
+    // Mounted before apply: the bridge derives its advertised capabilities and
+    // its elicitation handler from the seams present at connect time.
+    await ctx.plugin(UserQuestionService)
+    await apply(ctx, { ...modernFixtureConfig('modern'), protocolEra: 'auto' })
+  }, 30_000)
+
+  afterAll(async () => {
+    if (ctx) await ctx.fiber.dispose()
+    await sleep(200)
+  })
+
+  it('discovers the fixture tools over the modern era', () => {
+    const names = ctx.tools.schemas().map(s => s.name)
+    expect(names).toContain('mcp__modern__echo')
+    expect(names).toContain('mcp__modern__add')
+    expect(names).toContain('mcp__modern__greet')
+  })
+
+  it('executes a tool call over the modern era', async () => {
+    const result = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: nextCallId(), name: 'mcp__modern__add', arguments: { a: 2, b: 3 },
+    })
+    expect(result.isError).toBe(false)
+    expect(textOf(result.content[0])).toBe('5')
+  })
+
+  it('fulfils a multi-round-trip elicitation through ctx.userQuestions', async () => {
+    const asked: AskUserQuestionRequest[] = []
+    const ask = vi.spyOn(ctx.userQuestions, 'ask').mockImplementation(async (request) => {
+      asked.push(request)
+      return { answers: [{ id: 'name', selected: [], custom: 'Ada' }] }
+    })
+
+    try {
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: nextCallId(), name: 'mcp__modern__greet', arguments: {},
+      })
+      expect(result.isError).toBe(false)
+      expect(textOf(result.content[0])).toBe('Hello, Ada')
+      expect(asked).toHaveLength(1)
+      expect(asked[0]!.questions[0]!.id).toBe('name')
+      expect(asked[0]!.questions[0]!.detail ?? '').toContain('Which name should the greeting use?')
+    } finally {
+      ask.mockRestore()
+    }
+  })
+
+  it('fails a sampling request visibly instead of answering it', async () => {
+    const result = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: nextCallId(), name: 'mcp__modern__use-sampling', arguments: {},
+    })
+    expect(result.isError).toBe(true)
+    expect(textOf(result.content[0]).toLowerCase()).toContain('sampling')
+  })
+
+  it('fails a roots request visibly instead of answering it', async () => {
+    const result = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: nextCallId(), name: 'mcp__modern__use-roots', arguments: {},
+    })
+    expect(result.isError).toBe(true)
+    expect(textOf(result.content[0]).toLowerCase()).toContain('roots')
+  })
+
+  it('re-syncs tools after the server announces a list change', async () => {
+    expect(ctx.tools.get('mcp__modern__dynamic')).toBeUndefined()
+
+    const added = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: nextCallId(), name: 'mcp__modern__add-tool', arguments: {},
+    })
+    expect(added.isError).toBe(false)
+
+    // The announcement reaches the bridge only through the client's open
+    // subscription, and the re-sync must evict the cached list to see it.
+    await vi.waitFor(() => {
+      expect(ctx.tools.get('mcp__modern__dynamic')).toBeDefined()
+    }, { timeout: 15_000, interval: 100 })
+  }, 30_000)
+})
+
+describe('2026-07-28 era — one factory, both eras', () => {
+  it('advertises identical tool names under the legacy and modern handshakes', async () => {
+    const legacy = await mountRegistry()
+    const modern = await mountRegistry()
+    try {
+      await apply(legacy, modernFixtureConfig('eras'))
+      await apply(modern, { ...modernFixtureConfig('eras'), protocolEra: 'auto' })
+
+      const legacyNames = legacy.tools.schemas().map(s => s.name)
+      expect(legacyNames).toContain('mcp__eras__echo')
+      expect(modern.tools.schemas().map(s => s.name)).toEqual(legacyNames)
+    } finally {
+      await legacy.fiber.dispose()
+      await modern.fiber.dispose()
+    }
+  }, 60_000)
+})
+
+describe('2026-07-28 era — tool list descriptor cache', () => {
+  it('serves a fresh cached list to a second connection instead of re-listing', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'mcp-cache-e2e-'))
+    const extraFile = join(home, 'extra-tool')
+    const config: Config = {
+      ...modernFixtureConfig('cached', { DSH_MCP_FIXTURE_EXTRA_FILE: extraFile }),
+      protocolEra: { pin: '2026-07-28' },
+    }
+    const first = await mountRegistry()
+    const second = await mountRegistry()
+    const third = await mountRegistry()
+    try {
+      await apply(first, config)
+      expect(first.tools.get('mcp__cached__echo')).toBeDefined()
+      expect(first.tools.get('mcp__cached__later')).toBeUndefined()
+
+      // Every server process started from now on does advertise `later`, so a
+      // second connection that re-listed would surface it. Its absence shows
+      // the bridge served the first connection's descriptors for the
+      // server-declared freshness window.
+      await writeFile(extraFile, '')
+      await apply(second, config)
+      expect(second.tools.get('mcp__cached__echo')).toBeDefined()
+      expect(second.tools.get('mcp__cached__later')).toBeUndefined()
+
+      // Eviction is the other half: once the entry is gone, the same config
+      // re-lists and does see the extra tool.
+      toolListCache.evictServer('cached')
+      await apply(third, config)
+      expect(third.tools.get('mcp__cached__later')).toBeDefined()
+    } finally {
+      await first.fiber.dispose()
+      await second.fiber.dispose()
+      await third.fiber.dispose()
+      await sleep(200)
+      await rm(home, { recursive: true, force: true })
+    }
+  }, 60_000)
 })
