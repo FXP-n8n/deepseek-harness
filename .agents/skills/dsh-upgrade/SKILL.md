@@ -76,6 +76,7 @@ The published package is `@deepseek-ai/dsh`, and its bin is `dsh`. Install an ex
 
 ```sh
 npm view @deepseek-ai/dsh dist-tags
+npm view @deepseek-ai/dsh version               # what a bare install picks
 pnpm add -g @deepseek-ai/dsh@<version-or-tag>    # or: npm install -g @deepseek-ai/dsh@<version-or-tag>
 dsh --version
 ```
@@ -90,6 +91,8 @@ Upgrading the CLI does not modify an existing `$DSH_HOME/profiles/<name>`. A pro
 dsh plugin --profile web add @deepseek-ai/dsh-web-app@<version>
 dsh plugin --profile web update
 ```
+
+A pnpm that gates dependency build scripts reports `ERR_PNPM_IGNORED_BUILDS` and `dsh` reports the failure in the profile directory, even though the dependency, its lockfile entry, and its files are already written. Allow the named packages (`--allow-build=<package>`, or pnpm's build approvals for that profile directory) and re-run. Confirm a bundle move in the profile's `package.json`, its `pnpm-lock.yaml`, and a composing `--dump-config`, not in the command's exit status alone.
 
 To adopt a changed shipped template, initialize a new profile from it. `--from-default-profile <template>` copies only the template's bundle list and patch-reload policy into a new, unused profile name; shipped names are reserved, an existing directory is refused by naming its `package.json`, and no profile is upgraded in place. Compare the shipped layers with the local delta before copying the user layer across.
 
